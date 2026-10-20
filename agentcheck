@@ -20,7 +20,7 @@
 
 set -uo pipefail
 
-VERSION="1.0"
+VERSION="1.1"
 VERBOSE=0
 PLAIN=0
 
@@ -28,7 +28,7 @@ for a in "$@"; do
   case "$a" in
     -v|--verbose) VERBOSE=1 ;;
     -p|--plain)   PLAIN=1 ;;
-    -h|--help)    sed -n '2,22p' "$0" | sed 's/^#//;s/^ //'; exit 0 ;;
+    -h|--help)    sed -n '2,19p' "$0" | sed 's/^#//;s/^ //'; exit 0 ;;
   esac
 done
 
@@ -131,9 +131,10 @@ printf 'detected:%s\n' "$STACKS"
 section "1. MEMORY  -  will your agent still know this tomorrow"
 
 MEM_LAYER=0
-for f in "$CLAUDE_DIR/CLAUDE.md" "$HOME/CLAUDE.md" "$OC_DIR/workspace/MEMORY.md" "$OC_DIR/workspace/AGENTS.md" "$CODEX_DIR/AGENTS.md"; do
+for f in "$CLAUDE_DIR/CLAUDE.md" "$HOME/CLAUDE.md" "$OC_DIR/workspace/MEMORY.md" "$OC_DIR/workspace/AGENTS.md" "$CODEX_DIR/AGENTS.md" "$HOME/.cursorrules"; do
   [ -f "$f" ] && MEM_LAYER=1
 done
+[ -d "$HOME/.cursor/rules" ] && MEM_LAYER=1
 
 if [ "$MEM_LAYER" = "0" ]; then
   fail crit "No durable memory file anywhere" \
@@ -143,7 +144,7 @@ if [ "$MEM_LAYER" = "0" ]; then
 else
   ok "durable memory file present"
   # size trap: oversized memory files get silently truncated at load
-  for f in "$CLAUDE_DIR/CLAUDE.md" "$HOME/CLAUDE.md" "$OC_DIR/workspace/MEMORY.md" "$OC_DIR/workspace/AGENTS.md"; do
+  for f in "$CLAUDE_DIR/CLAUDE.md" "$HOME/CLAUDE.md" "$OC_DIR/workspace/MEMORY.md" "$OC_DIR/workspace/AGENTS.md" "$CODEX_DIR/AGENTS.md" "$HOME/.cursorrules"; do
     [ -f "$f" ] || continue
     sz=$(wc -c < "$f" | tr -d ' ')
     if [ "$sz" -gt 24000 ]; then
@@ -163,7 +164,10 @@ else
 fi
 
 # a memory file full of live facts rots. check for a source of truth pointer.
-for f in "$CLAUDE_DIR/CLAUDE.md" "$HOME/CLAUDE.md" "$OC_DIR/workspace/MEMORY.md"; do
+# same file set as the existence check above: an OpenClaw or Codex box keeps its
+# primary instructions in AGENTS.md, so leaving it out let this check silently
+# no-op on exactly the stacks most likely to run it. .cursorrules covers Cursor users.
+for f in "$CLAUDE_DIR/CLAUDE.md" "$HOME/CLAUDE.md" "$OC_DIR/workspace/MEMORY.md" "$OC_DIR/workspace/AGENTS.md" "$CODEX_DIR/AGENTS.md" "$HOME/.cursorrules"; do
   [ -f "$f" ] || continue
   if grep -qiE 'source of truth|query|do not trust|verify' "$f" 2>/dev/null; then
     ok "$(basename "$f") points at a source of truth instead of copying facts"
@@ -173,7 +177,6 @@ for f in "$CLAUDE_DIR/CLAUDE.md" "$HOME/CLAUDE.md" "$OC_DIR/workspace/MEMORY.md"
       "Anything you hardcode into a memory file goes stale and then gets asserted back to you with total confidence months later. A wrong memory is worse than no memory because you stop checking." \
       "Add a line at the top naming where live facts live, and instruct the agent to query it rather than trust the copy in the file."
   fi
-  break
 done
 
 # ---------------------------------------------------------------- 2. cost
@@ -265,10 +268,20 @@ fi
 
 # scheduled jobs writing into live sessions.
 # only fires on real job definitions, never on the mere presence of a config key.
-CRON_UNSAFE=$(python3 - "$OC_CFG" "$OC_DIR/cron/jobs.json" <<'PY' 2>/dev/null
-import json,sys,os
+# current OpenClaw keeps jobs in the SQLite state db (state/openclaw.sqlite);
+# older installs kept them in cron/jobs.json, which an upgrade archives to a
+# .migrated name. read both, or an upgraded box passes this critical silently.
+OC_STATE_DB="$OC_DIR/state/openclaw.sqlite"
+CRON_UNSAFE=$(python3 - "$OC_CFG" "$OC_DIR/cron/jobs.json" "$OC_STATE_DB" <<'PY' 2>/dev/null
+import json,sys,os,sqlite3
+cfg,legacy,db = sys.argv[1],sys.argv[2],sys.argv[3]
+def unsafe(j):
+    if j.get('payload',{}).get('kind') == 'heartbeat': return False
+    return str(j.get('sessionTarget','')).lower() not in ('isolated','new')
+bad=0
+# legacy job definitions living in json (openclaw.json + cron/jobs.json)
 jobs=[]
-for p in sys.argv[1:]:
+for p in (cfg,legacy):
     if not os.path.isfile(p): continue
     try: d=json.load(open(p))
     except Exception: continue
@@ -280,8 +293,21 @@ for p in sys.argv[1:]:
                 jobs.append(x)
             for v in x.values(): walk(v)
     walk(d)
-bad=[j for j in jobs if str(j.get('sessionTarget','')).lower() not in ('isolated','new')]
-print(len(bad))
+bad += sum(1 for j in jobs if unsafe(j))
+# current store: the shared sqlite state db, table cron_jobs, one job per row
+if os.path.isfile(db):
+    try:
+        con=sqlite3.connect(f"file:{db}?mode=ro",uri=True,timeout=2)
+        rows=con.execute("select job_json from cron_jobs").fetchall()
+        con.close()
+        for (jj,) in rows:
+            try: j=json.loads(jj)
+            except Exception: continue
+            if not j.get('enabled'): continue   # a disabled job never runs
+            if unsafe(j): bad+=1
+    except Exception:
+        pass
+print(bad)
 PY
 )
 if [ "${CRON_UNSAFE:-0}" -gt 0 ]; then
@@ -289,7 +315,7 @@ if [ "${CRON_UNSAFE:-0}" -gt 0 ]; then
     "${CRON_UNSAFE} scheduled job(s) do not run in an isolated session" \
     "A scheduled job that lands inside a live conversation injects a different model into that context and forces a compaction. The visible symptom is your agent losing its memory for no reason, days later, and it is almost impossible to trace back to the cron that caused it." \
     "Set every scheduled job to run isolated. No exceptions, including the ones that look harmless."
-elif [ -f "$OC_DIR/cron/jobs.json" ] || [ -f "$OC_CFG" ]; then
+elif [ -f "$OC_STATE_DB" ] || [ -f "$OC_DIR/cron/jobs.json" ] || [ -f "$OC_CFG" ]; then
   ok "no scheduled job is writing into a live session"
 fi
 
@@ -302,7 +328,12 @@ for f in "$OC_CFG" "$CLAUDE_DIR/settings.json" "$CLAUDE_DIR/settings.local.json"
   [ -f "$f" ] || continue
   if grep -qiE '"?(api_?key|token|secret|password|bearer)"?[[:space:]]*[:=][[:space:]]*"?(sk-|xox|gh[pous]_|AKIA|eyJ|[A-Za-z0-9_\-]{24,})' "$f" 2>/dev/null; then
     perms=$(ls -l "$f" 2>/dev/null | cut -c1-10)
-    if printf '%s' "$perms" | grep -qE '^-rw-------'; then
+    # safe = no group-read (char 5) and no other-read (char 8). matching only
+    # 600 flagged modes that are *stricter* -- 400 (-r--------) and 700
+    # (-rwx------) have no group/other access at all, yet the old
+    # '^-rw-------' test called them world-readable and told the user to
+    # chmod 600 a file already locked down tighter than that.
+    if printf '%s' "$perms" | grep -qE '^-[-rwx]{3}-[-rwx]{2}-[-rwx]{2}$'; then
       ok "$(basename "$f") holds credentials but is owner-only"
     else
       LEAKY=1
@@ -324,7 +355,15 @@ for wd in "$OC_DIR/workspace" "$PWD"; do
       "One git add -A and your keys are in history. Rotating them afterward is the easy part. Finding every clone and every fork is not." \
       "Add .env to .gitignore, then confirm it is not already committed before you relax."
   else
-    ok "$(basename "$wd") repo has no exposed .env"
+    # .env is absent or in .gitignore — it may still be tracked in git history
+    if have git && git -C "$wd" ls-files --error-unmatch ".env" >/dev/null 2>&1; then
+      fail crit ".env is committed to your git history" \
+        "$wd/.env is tracked by git despite being ignored or absent" \
+        ".gitignore stops future commits but does not rewrite history. Everyone with a clone of this repo has a copy of the secrets it held when it was committed. If you pushed it, assume it is compromised." \
+        "Rotate every secret in .env now. Remove it from history: git filter-repo --path .env --invert-paths (or BFG Repo-Cleaner). Add .env to .gitignore if not already done."
+    else
+      ok "$(basename "$wd") repo has no exposed .env"
+    fi
   fi
 done
 
@@ -333,9 +372,15 @@ done
 section "5. DURABILITY  -  what an update or a reboot takes out"
 
 # config backup
+# a dated/.bak copy beside the file OR the config tracked in git both count.
+# without the git arm this check nagged the exact user who took its own advice
+# ("put the whole config directory in a private git repo") -- a false warning
+# on the best-practice setup.
 if [ -f "$OC_CFG" ]; then
   if ls "$OC_DIR"/openclaw.json.* >/dev/null 2>&1 || ls "$OC_DIR"/*.bak >/dev/null 2>&1; then
     ok "config has at least one backup beside it"
+  elif have git && git -C "$OC_DIR" ls-files --error-unmatch "$(basename "$OC_CFG")" >/dev/null 2>&1; then
+    ok "config file is tracked in git (version-controlled backup)"
   else
     fail warn "No backup of your agent config" \
       "openclaw.json has no .bak or dated copy" \
@@ -387,7 +432,10 @@ for sdir in "$CLAUDE_DIR/projects" "$OC_DIR/agents"; do
 done
 
 # free space
-FREE=$(df -m "$HOME" 2>/dev/null | awk 'NR==2{print $4}')
+# -P forces POSIX single-line-per-filesystem output; without it GNU df wraps a
+# long device name (LVM / encrypted / network mounts) onto its own line, NR==2
+# lands on that wrap, $4 is empty, and this critical silently never fires.
+FREE=$(df -Pm "$HOME" 2>/dev/null | awk 'NR==2{print $4}')
 if [ -n "${FREE:-}" ]; then
   if [ "$FREE" -lt 10000 ]; then
     fail crit "Under 10 GB free on the agent machine" \
@@ -408,6 +456,10 @@ if have crontab && crontab -l 2>/dev/null | grep -qiE 'health|check|monitor|hear
 if [ -f "$OC_CFG" ] && grep -qiE 'heartbeat|healthcheck|alert' "$OC_CFG" 2>/dev/null; then HEALTH=1; fi
 ls "$HOME/Library/LaunchAgents"/*.plist >/dev/null 2>&1 && \
   grep -liE 'health|monitor|heartbeat' "$HOME/Library/LaunchAgents"/*.plist >/dev/null 2>&1 && HEALTH=1
+# Linux: a systemd timer is the OS scheduler, the same role cron and launchd play.
+# checked only against timers (admin-defined scheduled jobs) so stock system
+# timers -- apt-daily, logrotate, man-db, fstrim, e2scrub -- cannot false-pass this.
+if have systemctl && systemctl list-timers --all --no-legend 2>/dev/null | grep -qiE 'health|monitor|heartbeat|healthcheck|alert'; then HEALTH=1; fi
 
 if [ "$HEALTH" = "0" ]; then
   fail warn "Nothing tells you when an agent stops working" \
@@ -419,8 +471,12 @@ else
 fi
 
 # a scheduled job that swallows its own errors
+# match only redirects that actually discard STDERR: 2>/dev/null, &>/dev/null,
+# >&/dev/null, or >/dev/null 2>&1. a plain >/dev/null silences stdout only and
+# leaves stderr flowing to cron mail, so counting it told the user a job that can
+# still fail loudly was throwing its errors away -- a false positive.
 if have crontab; then
-  SILENT=$(crontab -l 2>/dev/null | grep -cE '2?>[&]?[[:space:]]*/dev/null' || true)
+  SILENT=$(crontab -l 2>/dev/null | grep -cE '2>[[:space:]]*/dev/null|[&]>[[:space:]]*/dev/null|>&[[:space:]]*/dev/null|/dev/null[[:space:]]+2>&1' || true)
   if [ "${SILENT:-0}" -gt 0 ]; then
     fail warn "Scheduled jobs are discarding their errors" \
       "${SILENT} cron entr(y/ies) redirect output to /dev/null" \

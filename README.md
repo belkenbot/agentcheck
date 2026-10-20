@@ -77,6 +77,20 @@ specific cost. A few examples of what is behind the checks:
 The full writeup of what broke, what it cost, and how each one got fixed:
 **https://belken.ai/field-manual**
 
+## Tests
+
+Every bug fixed here so far was the same shape: a check that silently stopped
+firing on a real setup. `test/run-tests.sh` guards against that. It builds a
+throwaway fake `HOME` for each scenario, runs agentcheck against it, and asserts
+the right finding fired or stayed silent.
+
+```bash
+bash test/run-tests.sh
+```
+
+Exits `0` when every assertion passes, `1` otherwise. Add a scenario when you add
+a check.
+
 ## Exit codes
 
 Always `0`. This is a report, not a gate. If you want it in CI, parse the output.
