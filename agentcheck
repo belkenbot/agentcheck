@@ -20,7 +20,7 @@
 
 set -uo pipefail
 
-VERSION="1.1"
+VERSION="1.3"
 VERBOSE=0
 PLAIN=0
 
@@ -228,7 +228,7 @@ section "3. BLAST RADIUS  -  what your agent can do that you have not thought ab
 GUARD=0
 for f in "$CLAUDE_DIR/CLAUDE.md" "$HOME/CLAUDE.md" "$OC_DIR/workspace/AGENTS.md" "$OC_DIR/workspace/SOUL.md" "$CODEX_DIR/AGENTS.md"; do
   [ -f "$f" ] || continue
-  grep -qiE 'never|do not|approval|ask (me|first)|without (my |explicit )?(approval|permission)' "$f" 2>/dev/null && GUARD=1
+  grep -qiE 'approval|ask (me|first)|without (my |explicit )?(approval|permission)|(never|do[ ]?not).{0,50}(publish|post|push|send|spend|purchase|contact|email|message|deploy|delete|remove|touch|buy)' "$f" 2>/dev/null && GUARD=1
 done
 
 if [ "$GUARD" = "0" ]; then
@@ -347,8 +347,15 @@ done
 [ "$LEAKY" = "0" ] && ok "no world-readable credential files found"
 
 # secrets committed to a git repo
+# $OC_DIR/workspace and $PWD resolve to the same path when the tool is run from
+# inside the workspace. Without dedup every finding fires twice and the verdict
+# inflates the critical count by one per duplicate directory.
+_seen_wd=":"
 for wd in "$OC_DIR/workspace" "$PWD"; do
   [ -d "$wd/.git" ] || continue
+  _rwd="$(cd "$wd" 2>/dev/null && pwd)" || continue
+  case "$_seen_wd" in *":$_rwd:"*) continue ;; esac
+  _seen_wd="$_seen_wd$_rwd:"
   if [ -f "$wd/.env" ] && ! grep -qE '(^|/)\.env' "$wd/.gitignore" 2>/dev/null; then
     fail crit "A .env file sits in a git repo and is not ignored" \
       "$wd/.env is not covered by .gitignore" \
